@@ -4,7 +4,7 @@ The Windows PC runs YuNet and SFace against its webcam and enrolled faces. Each 
 
 The phone viewer shows up to 100 recent Supabase records, with granted and denied counts, a seven-day activity chart, a pairing check, and a searchable access log. You can filter by name, decision, and date, then export the displayed records as CSV. Turn on **Show connection tests** to see synthetic smoke test events. It updates automatically while visible, with periodic checks as a fallback for Supabase Realtime. It shows the name or unknown-face label, decision, similarity, and event time in the phone's timezone. Face embeddings stay on the recognition device. Visitor photos are optional and can be uploaded to a private Supabase bucket. The Pi can drive a relay after liveness and installation checks. Physical door position requires a sensor.
 
-See the [Raspberry Pi door controller guide](docs/raspberry-pi-door-controller.md) for Windows simulation, GPIO bench tests, SSH deployment, automatic startup with systemd, and owner alerts.
+See the [Raspberry Pi door controller guide](docs/raspberry-pi-door-controller.md) for Windows simulation, GPIO bench tests, SSH deployment, automatic startup with systemd, SSD1306 setup, Windows display simulation, and owner alerts.
 
 ## Source on GitHub
 

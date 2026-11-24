@@ -28,6 +28,34 @@ for file in "models/$detector" "models/$recognizer" dataset/authorized_faces.jso
     fi
 done
 
+python3 -B - "$source_dir" <<'PYTHON'
+import sys
+from pathlib import Path
+
+import cv2
+import gpiozero
+import lgpio
+import numpy as np
+
+version = tuple(map(int, cv2.__version__.split(".")[:2]))
+if version < (4, 8) or not hasattr(cv2, "FaceDetectorYN") or not hasattr(cv2, "FaceRecognizerSF"):
+    raise SystemExit("Install OpenCV 4.8 or later with YuNet and SFace support.")
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "src"))
+from face_engine import FaceEngine
+
+engine = FaceEngine(root / "models/face_detection_yunet_2023mar.onnx",
+                    root / "models/face_recognition_sface_2021dec.onnx",
+                    root / "dataset/authorized_faces.json", .363)
+engine.detect(np.zeros((480, 640, 3), dtype=np.uint8))
+feature = engine.recognizer.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+if feature.size != 128 or not np.isfinite(feature).all():
+    raise SystemExit("The SFace model did not return a valid embedding.")
+print("Validated OpenCV, YuNet, SFace and the enrollment database.")
+PYTHON
+
+
 for group in gpio video audio; do
     if ! getent group "$group" >/dev/null; then
         echo "Required device group is missing: $group." >&2
@@ -46,7 +74,7 @@ fi
 install -d -m 0755 -o root -g root "$app" "$app/src" "$app/models" "$app/deploy"
 install -d -m 0750 -o root -g smart-door "$app/dataset"
 install -m 0640 -g smart-door "$source_dir/dataset/authorized_faces.json" "$app/dataset/"
-for module in recognize_face recognition_gate door_control face_engine supabase_events writer_credentials; do
+for module in recognize_face recognition_gate door_control display_panel face_engine supabase_events writer_credentials; do
     install -m 0644 "$source_dir/src/$module.py" "$app/src/"
 done
 install -m 0644 "$source_dir/models/$detector" "$source_dir/models/$recognizer" "$app/models/"
@@ -56,12 +84,6 @@ fi
 install -m 0644 "$source_dir/deploy/wait-for-devices.sh" "$app/deploy/"
 
 python3 -m venv --system-site-packages "$app/.venv"
-"$app/.venv/bin/python" -Bc '
-import cv2, gpiozero, lgpio
-version = tuple(map(int, cv2.__version__.split(".")[:2]))
-if version < (4, 8) or not hasattr(cv2, "FaceDetectorYN") or not hasattr(cv2, "FaceRecognizerSF"):
-    raise SystemExit("Use an OS package with OpenCV 4.8+ and YuNet/SFace support.")
-'
 
 install -d -m 0700 -o root -g root "$config"
 if [ ! -e "$config/smart-door.env" ]; then
@@ -77,6 +99,7 @@ install -m 0644 "$source_dir/deploy/smart-door.service" /etc/systemd/system/smar
 systemd-analyze verify /etc/systemd/system/smart-door.service
 systemctl daemon-reload
 systemctl enable smart-door.service
-echo "Installed and enabled for boot. Set the camera/audio in $config/smart-door.env if needed."
-echo "To test the current configuration now: sudo systemctl start smart-door.service"
+systemctl start --no-block smart-door.service
+echo "Installed, enabled for boot, and queued for immediate startup."
+echo "Check the current run: sudo journalctl -u smart-door.service -b"
 

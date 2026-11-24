@@ -10,6 +10,9 @@ if not require_enrollment_password(PROJECT / "dataset/.enrollment-auth.json"):
     raise SystemExit(1)
 
 import cv2
+import numpy as np
+
+from face_engine import save_enrollments
 
 YUNET_MODEL = str(PROJECT / "models/face_detection_yunet_2023mar.onnx")
 SFACE_MODEL = str(PROJECT / "models/face_recognition_sface_2021dec.onnx")
@@ -37,7 +40,7 @@ if not name:
 DATABASE.parent.mkdir(exist_ok=True)
 
 if os.path.exists(DATABASE):
-    with open(DATABASE, "r") as file:
+    with DATABASE.open(encoding="utf-8") as file:
         database = json.load(file)
 else:
     database = {"users": []}
@@ -144,7 +147,7 @@ try:
             feature = feature.flatten()
 
             norm = np.linalg.norm(feature)
-            if norm == 0:
+            if feature.size != 128 or not np.isfinite(norm) or norm == 0:
                 print("Could not process face. Try again.")
                 continue
 
@@ -162,8 +165,7 @@ try:
                     "embeddings": samples
                 })
 
-                with open(DATABASE, "w") as file:
-                    json.dump(database, file, indent=4)
+                save_enrollments(DATABASE, database)
 
                 print("\nENROLLMENT SUCCESSFUL!")
                 print("Registered:", name)

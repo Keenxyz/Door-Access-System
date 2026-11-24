@@ -1,16 +1,20 @@
 """Time-bound GPIO and speech. GPIO imports are deferred until Pi mode."""
 
 from contextlib import suppress
+from math import pi, sin
+from struct import pack
 from pathlib import Path
 from shutil import which
 from subprocess import DEVNULL, Popen, TimeoutExpired
 from tempfile import TemporaryDirectory
 from threading import Condition, Event, Thread
 from time import monotonic
+from wave import open as open_wave
 
 GREEN_PIN = 17
 RED_PIN = 27
 RELAY_PIN = 23
+DOORBELL_PIN = 22
 PULSE_SECONDS = 5.0
 
 
@@ -64,14 +68,16 @@ class Speaker:
         "DENIED": "Access Denied. Unauthorized Person Detected!",
     }
 
-    def __init__(self, *, enabled, simulate=False, alsa_device=None):
-        self.alsa_device = alsa_device
-        self.player = which("aplay") if enabled and alsa_device else None
-        self.program = which("espeak-ng") if enabled and (not alsa_device or self.player) else None
+    def __init__(self, *, enabled, simulate=False, alsa_device=None, doorbell=False):
+        self.alsa_device = alsa_device or ("default" if doorbell else None)
+        self.player = which("aplay") if enabled and self.alsa_device else None
+        self.program = which("espeak-ng") if enabled and (not self.alsa_device or self.player) else None
         self.simulate = simulate
         self.condition = Condition()
         self.stop = Event()
         self.pending = None
+        self.bell_pending = False
+        self.last_bell = float("-inf")
         self.worker = None
         if enabled and not self.program:
             print("Speaker disabled. Install espeak-ng and alsa-utils, then configure the audio output.")
@@ -88,19 +94,47 @@ class Speaker:
                 self.pending = message
                 self.condition.notify()
 
+    def ring(self):
+        if self.worker is None or not (self.player or self.simulate):
+            return
+        with self.condition:
+            now = monotonic()
+            if not self.stop.is_set() and now - self.last_bell >= 2:
+                self.last_bell = now
+                self.bell_pending = True
+                self.condition.notify()
+
+    def play_bell(self):
+        rate = 22050
+        samples = []
+        for frequency in (784, 587):
+            length = rate // 5
+            for i in range(length):
+                envelope = min(i / 240, (length - i) / 480, 1)
+                samples.append(round(9000 * envelope * sin(2 * pi * frequency * i / rate)))
+        with TemporaryDirectory() as directory:
+            path = str(Path(directory) / "doorbell.wav")
+            with open_wave(path, "wb") as sound:
+                sound.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+                sound.writeframes(pack(f"<{len(samples)}h", *samples))
+            return self.run_audio([self.player, "-q", "-D", self.alsa_device, path])
+
     def run(self):
         while not self.stop.is_set():
             with self.condition:
-                self.condition.wait_for(lambda: self.pending is not None or self.stop.is_set())
+                self.condition.wait_for(lambda: self.pending is not None or self.bell_pending or self.stop.is_set())
                 if self.stop.is_set():
                     break
                 message = self.pending
                 self.pending = None
+                if message is None:
+                    self.bell_pending = False
             if self.simulate:
-                print(f"[simulation] speaker: {message}", flush=True)
+                print(f"[simulation] speaker: {message or 'doorbell chime'}", flush=True)
                 continue
             try:
-                if not self.play(message) and not self.stop.is_set():
+                played = self.play(message) if message is not None else self.play_bell()
+                if not played and not self.stop.is_set():
                     print("Could not play the door announcement.", flush=True)
             except OSError:
                 print("Could not play the door announcement.", flush=True)
@@ -133,6 +167,20 @@ class Speaker:
             self.condition.notify_all()
         if self.worker is not None:
             self.worker.join(timeout=2)
+
+
+def open_doorbell(speaker):
+    from gpiozero import Button
+
+    if not speaker.player or not speaker.program:
+        raise RuntimeError("Install espeak-ng and alsa-utils before enabling the doorbell.")
+    button = Button(DOORBELL_PIN, pull_up=True, bounce_time=.10)
+    try:
+        button.when_pressed = speaker.ring
+    except Exception:
+        button.close()
+        raise
+    return button
 
 
 class DoorController:

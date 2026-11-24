@@ -64,7 +64,7 @@ The Raspberry Pi GPIO inputs and outputs are **3.3 V logic**. Never feed 5 V or 
 | Green LED | 17 | 11 | GPIO through its own 330 ohm resistor to the LED anode. Cathode to GND. |
 | Red LED | 27 | 13 | GPIO through its own 330 ohm resistor to the LED anode. Cathode to GND. |
 | Relay control | 23 | 16 | Relay input through a verified 3.3 V-compatible interface. |
-| Future doorbell | 22 | 15 | Reserved. |
+| Doorbell | 22 | 15 | Verified dry-contact momentary switch to GND. Enabled with `--doorbell`. |
 | Ground | — | 6 | LED return and relay logic reference if the relay module requires a shared reference. |
 
 Power the relay module as specified by its datasheet. A board with a 5 V input pull-up or drive requirement needs a suitable driver or isolator. Confirm what the relay input sees while the Pi is booting, rebooting, or stopped. The inactive GPIO level is maintained by the hardware interface, typically an appropriate external pull-up or pull-down. Software sets the relay inactive when it acquires GPIO 23.
@@ -108,6 +108,56 @@ The camera starts recognizing immediately. With the relay enabled, each register
 
 The RGB liveness gate combines random head turns and a passive presentation-attack model. This is prototype protection. Test it on the installed camera against controlled prints and replays, and use a validated PAD sensor and independent second factor for a production entry point. The UI records a secure command and leaves actual door position unverified until a door-position sensor is installed. [Open Model Zoo PAD model](https://docs.openvino.ai/2023.3/omz_models_model_anti_spoof_mn3.html) · [NIST biometric presentation attack guidance](https://pages.nist.gov/800-63-4/sp800-63b.html)
 
+## SSD1306 OLED and doorbell
+
+### Preview on Windows
+
+Run one command from the project folder. The two OLED layouts show your live webcam as a magnified black-and-white preview. The color demo cycles through synthetic recognition states. Press **Q** or **Esc** to close.
+
+```powershell
+.\.venv\Scripts\python.exe .\src\recognize_face.py --simulate-display --display-layout mono
+.\.venv\Scripts\python.exe .\src\recognize_face.py --simulate-display --display-layout mono32
+.\.venv\Scripts\python.exe .\src\recognize_face.py --simulate-display --display-layout color
+```
+
+The live OLED acts as a camera monitor. It fits the whole frame, preserves its proportions, and displays it in black and white without names, face boxes, or access messages. It blanks when frames stop arriving. The installed driver supports a confirmed **I²C SSD1306**, with **128×64** and **128×32** selectable. A color TFT or SPI OLED needs its own verified driver and pin mapping. Add `--camera 1` to the preview command if your webcam uses index 1.
+
+### Connect a verified four-pin I²C SSD1306
+
+Check the marked pins, module operating voltage, and display resolution before applying power. Use the wiring table only when the module accepts 3.3 V power and 3.3 V I²C signaling. Match the labels because pin ordering varies.
+
+| OLED label | Raspberry Pi 3 Model B |
+|---|---|
+| GND | Ground, for example physical pin 6 |
+| VCC | Verified 3.3 V connection, physical pin 1 |
+| SDA | GPIO 2, physical pin 3 |
+| SCL | GPIO 3, physical pin 5 |
+
+On the Pi, run `sudo raspi-config` and enable **I2C** under **Interface Options**. Reboot if requested. Install the optional display dependency and read the address.
+
+```bash
+sudo apt install -y python3-luma.oled i2c-tools
+sudo i2cdetect -y 1
+```
+
+The recognizer accepts `0x3c` or `0x3d`. Use the address reported by the scan and the resolution printed on the module or datasheet. Grant the service access to I²C by running `sudo systemctl edit smart-door.service` and saving this drop-in.
+
+```ini
+[Service]
+SupplementaryGroups=i2c
+```
+
+Add the verified options to the existing `SMART_DOOR_ARGS` value in `/etc/smart-door/smart-door.env`. This example enables a dry-contact doorbell and a confirmed 128×64 display at 0x3c with the relay disabled.
+
+```dotenv
+SMART_DOOR_ARGS="--doorbell --oled-ssd1306 128x64 --oled-address 0x3c"
+```
+
+Use `--oled-ssd1306 128x32` for a confirmed 128×32 display. OLED frames stay in memory. Database visitor photos use their separate opt-in flag. Restart with `sudo systemctl restart smart-door.service`. If the OLED is unavailable, the journal records the error and recognition can continue.
+
+The optional doorbell connects a verified **dry-contact momentary switch** between **GPIO 22 (physical pin 15)** and ground. `--doorbell` enables the internal pull-up, debounce and an ALSA two-tone chime. The button does not operate the relay. For the initial test, leave the lock circuit disconnected and confirm the chime, OLED camera feed, LEDs, and speech.
+
+
 ## Start automatically at boot
 
 After copying the files and installing the packages, run these commands inside the Pi SSH session. The `cd` command opens the Pi project folder.
@@ -117,7 +167,7 @@ cd ~/smart-door-security
 sudo sh deploy/install-pi.sh
 ```
 
-The installer enables `smart-door.service` for future boots. It creates a dedicated `smart-door` system account, grants the service the `gpio`, `video`, and `audio` groups, and installs the read-only application and enrollment file under `/opt/smart-door`. Local CSV logs, the SQLite outbox and optional local photos are in `/var/lib/smart-door`. Device checks run with the same permissions as recognition. Shutdown sends SIGTERM so Python can secure GPIO and release the webcam. Failed runs retry after 10 seconds with a systemd start limit.
+The installer checks the installed OpenCV dependencies, loads YuNet, SFace and the enrollment database, then enables `smart-door.service` for future boots and requests its first start. It creates a dedicated `smart-door` system account, grants the service the `gpio`, `video`, and `audio` groups, and installs the read-only application and enrollment file under `/opt/smart-door`. Local CSV logs, the SQLite outbox and optional local photos are in `/var/lib/smart-door`. Device checks run with the same permissions as recognition. Shutdown sends SIGTERM so Python can secure GPIO and release the webcam. After a camera disconnect, the recognizer secures the GPIO outputs and exits. systemd spaces retries at least 20 seconds apart and checks device readiness each time, so it can recover when the camera returns. A rejected command-line configuration needs correction. The headless service requires working ALSA audio for liveness prompts when automatic unlock is enabled.
 
 ### Finish the initial setup
 
@@ -141,15 +191,16 @@ The installer enables `smart-door.service` for future boots. It creates a dedica
 
    systemd supplies the password as a credential. With a configured writer, events queue locally while offline and upload when the connection returns. With no configured writer, events go to the CSV. Follow [Supabase alerts and photos](#supabase-alerts-and-photos) to receive alerts on the viewer.
 
-3. Start the relay-disabled service, check the logs, and test both a registered face and an unknown visitor.
+3. After editing the settings, restart the relay-disabled service and test both a registered face and an unknown visitor.
 
    ```bash
-   sudo systemctl start smart-door.service
+   sudo systemctl restart smart-door.service
+   systemctl is-enabled smart-door.service
    systemctl status smart-door.service --no-pager
    sudo journalctl -u smart-door.service -b -f
    ```
 
-   Confirm the green and red LEDs and the spoken announcements. With sync configured, look for **Supabase confirmed upload** and verify the events in your viewer. Reboot once with `sudo reboot`, then check the service status and this boot's journal. After setup it will start without an SSH session. If startup hits its retry limit after a device or configuration failure, correct the cause and run `sudo systemctl reset-failed smart-door.service` followed by `sudo systemctl start smart-door.service`.
+   Confirm the green and red LEDs and the spoken announcements. With sync configured, look for **Supabase confirmed upload** and verify the events in your viewer. Reboot once with `sudo reboot`. Without starting the service manually, scan a face and check the LEDs and configured alerts. If you reconnect to check logs, run `sudo journalctl -u smart-door.service -b -n 50 --no-pager` and look for **Camera running**. If the journal shows a configuration error, correct the setting, then run `sudo systemctl reset-failed smart-door.service` and `sudo systemctl restart smart-door.service` once.
 
 ### Enable the relay after bench testing
 
@@ -161,7 +212,7 @@ After verification, edit `/etc/smart-door/smart-door.env` and add the relay opti
 SMART_DOOR_ARGS="--enable-unlock --relay-active low --lock-type power-to-unlock --pad-model /opt/smart-door/models/anti-spoof-mn3.onnx"
 ```
 
-Run `sudo systemctl restart smart-door.service`. Keep the standalone emergency release and independently verified idle relay state described above. To update the installed code or enrollment file from your Pi source checkout, stop the service, rerun the installer, then start it again. The installer preserves the service configuration and runtime logs.
+Run `sudo systemctl restart smart-door.service`. Keep the standalone emergency release and independently verified idle relay state described above. To update the installed code or enrollment file from your Pi source checkout, stop the service and rerun the installer. The installer starts it again. The installer preserves the service configuration and runtime logs.
 
 
 ## Supabase alerts and photos

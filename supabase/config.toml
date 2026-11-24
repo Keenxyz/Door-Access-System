@@ -1,0 +1,4 @@
+project_id = "door-access-system"
+
+[functions.door-alerts]
+verify_jwt = false

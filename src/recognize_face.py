@@ -5,7 +5,7 @@ import math
 import os
 import signal
 import sqlite3
-from argparse import ArgumentParser, ArgumentTypeError
+from argparse import SUPPRESS, ArgumentParser, ArgumentTypeError
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +13,7 @@ from time import monotonic, sleep
 from urllib.error import HTTPError
 from uuid import uuid4
 
-from door_control import DoorController, GpioOutputs, PULSE_SECONDS, SimulatedOutputs, Speaker
+from door_control import DoorController, GpioOutputs, PULSE_SECONDS, SimulatedOutputs, Speaker, open_doorbell
 from recognition_gate import Observation, RecognitionGate
 from supabase_events import (
     SupabaseEvents, report_supabase_error, setup_windows_writer, sync_saved_events,
@@ -46,6 +46,7 @@ def settings(argv=None):
     mode.add_argument("--relay-bench", action="store_true", help="Pulse the GPIO relay with the solenoid load disconnected.")
     mode.add_argument("--sync-pending", action="store_true", help="Upload saved scans without opening the camera.")
     mode.add_argument("--setup-writer", action="store_true", help="Verify and save a Supabase writer login for this Windows account.")
+    mode.add_argument("--simulate-display", action="store_true", help="Preview the live camera in monochrome, or run the synthetic color demo.")
     cloud = parser.add_mutually_exclusive_group()
     cloud.add_argument("--supabase", action="store_true", help="Require configured Supabase sync without prompting.")
     cloud.add_argument("--local-only", action="store_true", help="Log without uploading to Supabase.")
@@ -62,6 +63,14 @@ def settings(argv=None):
     parser.add_argument("--unlock-cooldown", type=float, default=8)
     parser.add_argument("--notification-cooldown", type=float, default=30)
     parser.add_argument("--capture-unknown", action="store_true", help="Capture one cropped JPEG per confirmed unknown visitor.")
+    parser.add_argument("--doorbell", action="store_true", help="Enable a dry-contact momentary button on GPIO 22.")
+    parser.add_argument("--oled-ssd1306", choices=("128x64", "128x32"),
+                        help="Enable a verified SSD1306 I2C OLED with this resolution.")
+    # Keep old systemd settings usable after switching the OLED to full-frame mode.
+    parser.add_argument("--oled-photo", action="store_true", help=SUPPRESS)
+    parser.add_argument("--oled-address", choices=("0x3c", "0x3d"), help="Measured SSD1306 I2C address.")
+    parser.add_argument("--display-layout", choices=("color", "mono", "mono32"), default="color",
+                        help="Layout for the Windows display simulation.")
     parser.add_argument("--no-audio", action="store_true")
     parser.add_argument("--no-preview", action="store_true", help="Run without the OpenCV window, suitable for SSH.")
     parser.add_argument("--camera", type=camera_source, default=0, help="OpenCV camera index or Linux video device path.")
@@ -82,12 +91,18 @@ def settings(argv=None):
     if args.enable_unlock and (
         not args.hardware or not args.relay_active or not args.lock_type or not args.pad_model
         or args.confirm_frames < 3 or args.threshold <= 0
-        or args.simulate or args.relay_bench or args.sync_pending or args.setup_writer
+        or args.simulate or args.simulate_display or args.relay_bench or args.sync_pending or args.setup_writer
     ):
         parser.error("--enable-unlock requires Pi hardware, a tested relay polarity, confirmed lock type, "
                      "the PAD model, at least three consecutive frames, and a positive threshold.")
-    if args.hardware and args.simulate:
-        parser.error("--simulate does not run with --hardware.")
+    if args.hardware and (args.simulate or args.simulate_display):
+        parser.error("Simulation does not run with --hardware.")
+    if args.oled_ssd1306 and (not args.hardware or not args.oled_address):
+        parser.error("OLED output requires --hardware and an explicitly measured --oled-address.")
+    if args.oled_address and not args.oled_ssd1306:
+        parser.error("--oled-address requires --oled-ssd1306.")
+    if args.doorbell and (not args.hardware or args.no_audio):
+        parser.error("--doorbell requires Raspberry Pi hardware and speaker audio.")
     if args.enable_unlock and args.no_preview and args.no_audio:
         parser.error("Provide a preview or speaker for the liveness prompts.")
     return args
@@ -169,7 +184,7 @@ def controller_for(args, *, simulate=False, bench=False):
             raise RuntimeError("GPIO mode requires a Raspberry Pi. Use --simulate on Windows.")
         outputs = GpioOutputs(relay_enabled=relay_enabled, active_high=args.relay_active == "high")
     speaker = Speaker(enabled=args.hardware and not args.no_audio, simulate=simulate,
-                      alsa_device=os.environ.get("SMART_DOOR_ALSA_DEVICE"))
+                      alsa_device=os.environ.get("SMART_DOOR_ALSA_DEVICE"), doorbell=args.doorbell)
     try:
         if args.enable_unlock and args.no_preview and not speaker.program:
             raise RuntimeError("Install espeak-ng or use a display for the liveness prompts.")
@@ -250,6 +265,32 @@ def show_preview(cv2, frame, observations, outcome):
 
 
 
+def open_camera(cv2, source):
+    camera = cv2.VideoCapture(source, cv2.CAP_V4L2) if isinstance(source, str) else cv2.VideoCapture(source)
+    try:
+        if not camera.isOpened():
+            raise RuntimeError("Camera could not be opened. Check the camera index and whether it is in use.")
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    except BaseException:
+        camera.release()
+        raise
+    return camera
+
+
+def run_display_preview(args):
+    import cv2
+    from display_panel import preview_oled, simulate_panel
+
+    if args.display_layout == "color":
+        return simulate_panel()
+    camera = open_camera(cv2, args.camera)
+    try:
+        return preview_oled(camera, "128x64" if args.display_layout == "mono" else "128x32")
+    finally:
+        camera.release()
+
+
 def run_camera(args):
     import cv2
 
@@ -265,18 +306,16 @@ def run_camera(args):
                            notification_cooldown=args.notification_cooldown,
                            liveness_seconds=args.liveness_seconds if pad else None,
                            unlock_cooldown=max(args.unlock_cooldown, PULSE_SECONDS))
-    cloud = camera = None
+    cloud = camera = button = panel = None
     controller = controller_for(args)
     try:
+        if args.doorbell:
+            button = open_doorbell(controller.speaker)
+        if args.oled_ssd1306:
+            from display_panel import PanelOutput
+            panel = PanelOutput(args.oled_ssd1306, int(args.oled_address, 16))
         cloud = open_cloud(args)
-        if isinstance(args.camera, str):
-            camera = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
-        else:
-            camera = cv2.VideoCapture(args.camera)
-        if not camera.isOpened():
-            raise RuntimeError("Camera could not be opened. Check the camera index and whether it is in use.")
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        camera = open_camera(cv2, args.camera)
         if args.enable_unlock:
             print(f"Relay armed for a confirmed {args.lock_type} installation.")
         print("Camera running. Press Ctrl+C to stop." if args.no_preview else "Camera running. Press Q to stop.")
@@ -285,6 +324,8 @@ def run_camera(args):
             ok, frame = camera.read()
             if not ok or frame is None:
                 raise RuntimeError("Camera stopped returning frames.")
+            if panel is not None:
+                panel.observe(frame)
             faces = engine.detect(frame)
             observations = []
             for face in faces:
@@ -318,7 +359,12 @@ def run_camera(args):
             if not args.no_preview and show_preview(cv2, frame, observations, outcome):
                 return 0
     finally:
+        if button is not None:
+            with suppress(Exception):
+                button.close()
         controller.close()
+        if panel is not None:
+            panel.close()
         if camera is not None:
             camera.release()
             if not args.no_preview:
@@ -334,6 +380,8 @@ def main(argv=None):
             return setup_windows_writer(state_path(OUTBOX, args.state_dir))
         if args.sync_pending:
             return sync_saved_events(state_path(OUTBOX, args.state_dir))
+        if args.simulate_display:
+            return run_display_preview(args)
         if args.simulate:
             return run_simulation(args)
         if args.relay_bench:

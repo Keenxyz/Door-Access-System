@@ -1,8 +1,18 @@
+import { Buffer } from "node:buffer";
+import { createECDH } from "node:crypto";
+
+// @deno-types="npm:@types/web-push@3.6.4"
 import webpush from "npm:web-push@3.6.7";
 
 type DoorEvent = { id: string; device_id: string; occurred_at: string; notify: boolean;
   result: string; lock_command: string | null };
 type Subscription = { endpoint: string; p256dh: string; auth_key: string };
+type DoorWebhook = {
+  type?: string;
+  schema?: string;
+  table?: string;
+  record?: Partial<DoorEvent> | null;
+};
 
 const project = Deno.env.get("SUPABASE_URL");
 const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -12,10 +22,34 @@ const privateKey = Deno.env.get("DOOR_VAPID_PRIVATE_KEY");
 const subject = Deno.env.get("DOOR_VAPID_SUBJECT");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+function getVapidDetails() {
+  if (!publicKey || !/^B[A-Za-z0-9_-]{86}$/.test(publicKey) ||
+      !privateKey || !/^[A-Za-z0-9_-]{43}$/.test(privateKey) || !subject) return null;
+  try {
+    const contact = new URL(subject);
+    const validContact = (contact.protocol === "https:" && Boolean(contact.hostname)) ||
+      (contact.protocol === "mailto:" && contact.pathname.includes("@"));
+    if (!validContact) return null;
+
+    const keyPair = createECDH("prime256v1");
+    keyPair.setPrivateKey(Buffer.from(privateKey, "base64url"));
+    if (keyPair.getPublicKey().toString("base64url") !== publicKey) return null;
+    return { subject, publicKey, privateKey };
+  } catch {
+    return null;
+  }
+}
+
+const vapidDetails = getVapidDetails();
+
 function response(body: unknown, status = 200) {
-  return Response.json(body, {
+  return new Response(JSON.stringify(body), {
     status,
-    headers: { "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" },
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    },
   });
 }
 
@@ -45,9 +79,10 @@ function allowedEndpoint(endpoint: string) {
 }
 
 async function db<T>(path: string, method = "GET"): Promise<T> {
+  if (!project || !serviceKey) throw new Error("Database credentials are unavailable.");
   const result = await fetch(project + "/rest/v1/" + path, {
-    method, headers: { apikey: serviceKey!, Authorization: "Bearer " + serviceKey },
-    signal: AbortSignal.timeout(6000),
+    method, headers: { apikey: serviceKey, Authorization: "Bearer " + serviceKey },
+    redirect: "error", signal: AbortSignal.timeout(6000),
   });
   if (!result.ok) throw new Error("Database request failed (" + result.status + ")");
   return (method === "DELETE" ? null : await result.json()) as T;
@@ -61,25 +96,34 @@ Deno.serve(async (request) => {
     } });
   }
   if (request.method === "GET") {
-    return publicKey && privateKey && subject ? response({ publicKey }) : response({ error: "Push is not configured" }, 503);
+    return vapidDetails ? response({ publicKey: vapidDetails.publicKey }) :
+      response({ error: "Push is not configured" }, 503);
   }
   if (request.method !== "POST") return response({ error: "Method not allowed" }, 405);
   if (!(await validSecret(request.headers.get("x-door-webhook-secret")))) {
     return response({ error: "Unauthorized" }, 401);
   }
-  if (!project || !serviceKey || !publicKey || !privateKey || !subject) {
+  if (!project || !serviceKey || !vapidDetails) {
     return response({ error: "Push is not configured" }, 503);
   }
 
+  let body: DoorWebhook;
   try {
-    const body = await request.json();
-    if (body.type !== "INSERT" || body.schema !== "public" || body.table !== "door_events" ||
-        body.record?.result !== "DENIED" || body.record?.notify !== true) return response({ ignored: true });
-    const { id, device_id: device } = body.record;
-    if (typeof id !== "string" || typeof device !== "string" || !UUID.test(id) || !UUID.test(device)) {
-      return response({ error: "Invalid event ID" }, 400);
-    }
+    body = await request.json();
+  } catch {
+    return response({ error: "Expected a JSON webhook payload" }, 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return response({ error: "Expected a JSON webhook object" }, 400);
+  }
+  if (body.type !== "INSERT" || body.schema !== "public" || body.table !== "door_events" ||
+      body.record?.result !== "DENIED" || body.record?.notify !== true) return response({ ignored: true });
+  const { id, device_id: device } = body.record;
+  if (typeof id !== "string" || typeof device !== "string" || !UUID.test(id) || !UUID.test(device)) {
+    return response({ error: "Invalid event ID" }, 400);
+  }
 
+  try {
     const [event] = await db<DoorEvent[]>(
       "door_events?select=id,device_id,occurred_at,notify,result,lock_command&device_id=eq." + device + "&id=eq." + id,
     );
@@ -96,8 +140,8 @@ Deno.serve(async (request) => {
         (event.lock_command === "SECURE_REQUESTED" ? " · Lock command sent" : " · Lock status unverified"),
       timestamp: Date.parse(event.occurred_at), tag: "door:" + device + ":" + id, url: "/#activity",
     });
-    const outcomes = await Promise.allSettled(subscriptions.filter(({ endpoint }) => allowedEndpoint(endpoint))
-      .map(async (subscription) => {
+    const eligible = subscriptions.filter(({ endpoint }) => allowedEndpoint(endpoint));
+    const outcomes = await Promise.allSettled(eligible.map(async (subscription) => {
         try {
           await webpush.sendNotification({
             endpoint: subscription.endpoint,
@@ -105,18 +149,27 @@ Deno.serve(async (request) => {
           }, message, {
             TTL: 600,
             timeout: 7000,
-            vapidDetails: { subject, publicKey, privateKey },
+            vapidDetails,
           });
+          return "sent";
         } catch (error) {
           const status = (error as { statusCode?: number }).statusCode;
           if (status !== 404 && status !== 410) throw error;
           await db("door_push_subscriptions?endpoint=eq." + encodeURIComponent(subscription.endpoint), "DELETE");
+          return "expired";
         }
       }));
-    const failures = outcomes.filter((result) => result.status === "rejected").length;
-    if (failures) return response({ error: "Push delivery failed", failures }, 502);
-    return response({ ok: true });
+    const sent = outcomes.filter((result) => result.status === "fulfilled" && result.value === "sent").length;
+    const expired = outcomes.filter((result) => result.status === "fulfilled" && result.value === "expired").length;
+    const failures = outcomes.length - sent - expired;
+    const summary = { subscriptions: subscriptions.length, sent, expired, skipped: subscriptions.length - eligible.length };
+    if (failures) {
+      console.error("door-alerts push delivery failed", failures);
+      return response({ error: "Push delivery failed", failures, ...summary }, 502);
+    }
+    return response({ ok: true, ...summary });
   } catch {
+    console.error("door-alerts could not process an authorized webhook");
     return response({ error: "Could not process the door alert" }, 500);
   }
 });

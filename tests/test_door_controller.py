@@ -11,6 +11,7 @@ from threading import Condition
 from time import monotonic
 from unittest.mock import Mock, patch
 from urllib.error import URLError
+from wave import open as open_wave
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import recognize_face
 import supabase_events
 import writer_credentials
-from door_control import DoorController, Speaker
+from door_control import DOORBELL_PIN, DoorController, Speaker, open_doorbell
 from enrollment_auth import require_enrollment_password
 from recognition_gate import Observation, RecognitionGate
 from supabase_events import EVENTS_RPC, SupabaseEvents
@@ -297,6 +298,151 @@ class CredentialTests(unittest.TestCase):
                 self.assertFalse(require_enrollment_password(path))
             with patch("enrollment_auth.getpass", return_value=password):
                 self.assertTrue(require_enrollment_password(path))
+
+
+
+class DisplayDoorbellAndEnrollmentTests(unittest.TestCase):
+    def test_oled_shows_entire_frame_with_no_status_overlay(self):
+        import numpy as np
+        from display_panel import render_oled_frame
+
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        frame[:60, :80] = 255
+        frame[-60:, -80:] = 255
+        for resolution, height, view_width in (("128x64", 64, 85), ("128x32", 32, 43)):
+            with self.subTest(resolution=resolution):
+                pixels = render_oled_frame(frame, resolution)
+                left = (128 - view_width) // 2
+                self.assertEqual(pixels.shape, (height, 128))
+                self.assertEqual(set(np.unique(pixels)), {0, 255})
+                self.assertEqual(pixels[0, left], 255)
+                self.assertEqual(pixels[-1, left + view_width - 1], 255)
+                self.assertFalse(pixels[:, :left].any())
+                self.assertFalse(pixels[:, left + view_width:].any())
+                self.assertFalse(render_oled_frame(np.zeros_like(frame), resolution).any())
+
+    def test_oled_throttles_and_copies_camera_frames_before_annotations(self):
+        import numpy as np
+        from display_panel import PanelOutput
+
+        with (patch("display_panel.Thread"),
+              patch("display_panel.monotonic", side_effect=[0, .1, .25])):
+            panel = PanelOutput("128x64", 0x3c)
+            frame = np.zeros((32, 48, 3), dtype=np.uint8)
+            panel.observe(frame)
+            first = panel.latest[0]
+            frame[:] = 255
+            panel.observe(frame)
+            self.assertIs(panel.latest[0], first)
+            self.assertFalse(first.any())
+            panel.observe(frame)
+            self.assertTrue(panel.latest[0].all())
+            panel.close()
+
+    def test_oled_blanks_stale_feed_and_cleans_up_i2c(self):
+        import numpy as np
+        from display_panel import PanelOutput
+        from types import SimpleNamespace
+
+        screen = Mock()
+        serial = Mock()
+        image = Mock()
+        oled = Mock(return_value=screen)
+        i2c = Mock(return_value=serial)
+        modules = {
+            "luma.core.interface.serial": SimpleNamespace(i2c=i2c),
+            "luma.oled.device": SimpleNamespace(ssd1306=oled),
+            "PIL": SimpleNamespace(Image=image),
+        }
+        with (patch.dict(sys.modules, modules), patch("display_panel.Thread"),
+              patch("display_panel.monotonic", side_effect=[10, 10, 12])):
+            panel = PanelOutput("128x32", 0x3d)
+            panel.observe(np.full((48, 64, 3), 255, dtype=np.uint8))
+
+            def rendered(_image):
+                if screen.display.call_count == 2:
+                    panel.stop.set()
+
+            screen.display.side_effect = rendered
+            panel.run()
+        i2c.assert_called_once_with(port=1, address=0x3d)
+        oled.assert_called_once_with(serial, width=128, height=32)
+        first, second = [call.args[0] for call in image.fromarray.call_args_list]
+        self.assertEqual(first.shape, (32, 128))
+        self.assertTrue(first.any())
+        self.assertFalse(second.any())
+        screen.cleanup.assert_called_once()
+
+    def test_windows_oled_preview_renders_live_feed_without_recognition(self):
+        import cv2
+        import numpy as np
+
+        camera = Mock()
+        camera.read.return_value = True, np.full((48, 64, 3), 255, dtype=np.uint8)
+        with (patch.object(cv2, "VideoCapture", return_value=camera) as source,
+              patch.object(cv2, "imshow") as show, patch.object(cv2, "waitKey", return_value=ord("q")),
+              patch.object(cv2, "destroyAllWindows"), patch.object(recognize_face, "open_cloud") as cloud):
+            result = recognize_face.main(["--simulate-display", "--display-layout", "mono32", "--camera", "1"])
+        self.assertEqual(result, 0)
+        self.assertEqual(show.call_args.args[1].shape, (128, 512))
+        source.assert_called_once_with(1)
+        cloud.assert_not_called()
+        camera.release.assert_called_once()
+
+
+    def test_doorbell_button_calls_audio_only(self):
+        from types import SimpleNamespace
+
+        button = Mock()
+        factory = Mock(return_value=button)
+        speaker = Mock()
+        with patch.dict(sys.modules, {"gpiozero": SimpleNamespace(Button=factory)}):
+            self.assertIs(open_doorbell(speaker), button)
+        factory.assert_called_once_with(DOORBELL_PIN, pull_up=True, bounce_time=.10)
+        button.when_pressed()
+        self.assertEqual(speaker.method_calls, [unittest.mock.call.ring()])
+
+    def test_doorbell_chime_is_valid_pcm(self):
+        speaker = Speaker(enabled=False, alsa_device="default")
+        speaker.player = "aplay"
+
+        def read_wav(command):
+            self.assertEqual(command[:4], ["aplay", "-q", "-D", "default"])
+            with open_wave(command[-1], "rb") as file:
+                self.assertEqual(file.getnchannels(), 1)
+                self.assertEqual(file.getsampwidth(), 2)
+                self.assertEqual(file.getnframes(), 8820)
+                self.assertTrue(any(file.readframes(500)))
+            return True
+
+        with patch.object(speaker, "run_audio", side_effect=read_wav):
+            self.assertTrue(speaker.play_bell())
+
+    def test_failed_enrollment_write_preserves_existing_profiles(self):
+        from face_engine import save_enrollments
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "authorized_faces.json"
+            original = {"users": [{"name": "Demo", "embeddings": [[0.125]]}]}
+            save_enrollments(path, original)
+            with self.assertRaises(ValueError):
+                save_enrollments(path, {"users": [float("nan")]})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_camera_disconnect_releases_camera_and_stops_controller(self):
+        import cv2
+
+        camera = Mock()
+        camera.read.return_value = False, None
+        door = Mock()
+        with (patch.object(cv2, "VideoCapture", return_value=camera),
+              patch("face_engine.FaceEngine"),
+              patch.object(recognize_face, "controller_for", return_value=door)):
+            result = recognize_face.main(["--no-preview", "--local-only"])
+        self.assertEqual(result, 1)
+        door.close.assert_called_once()
+        camera.release.assert_called_once()
 
 
 

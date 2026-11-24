@@ -2,11 +2,29 @@
 
 import hashlib
 import json
+import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import cv2
 import numpy as np
 
 PAD_SHA384 = "6de4534964b723397b3e8c995cadcf43bc007cc2f9930b95ae25f76adccece5d1d4d058d0b15117b9e4a9f758424f92a"
+
+
+def save_enrollments(path, database):
+    """Replace the enrollment file only after writing and flushing all embeddings."""
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(database, file, indent=4, allow_nan=False)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def face_crop(frame, face):
