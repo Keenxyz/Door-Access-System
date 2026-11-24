@@ -1,0 +1,44 @@
+[Unit]
+Description=Smart Door Security recognition
+After=systemd-udevd.service network.target
+StartLimitIntervalSec=120s
+StartLimitBurst=4
+
+[Service]
+Type=exec
+User=smart-door
+Group=smart-door
+SupplementaryGroups=gpio video audio
+WorkingDirectory=/opt/smart-door
+StateDirectory=smart-door
+StateDirectoryMode=0700
+RuntimeDirectory=smart-door
+RuntimeDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GPIOZERO_PIN_FACTORY=lgpio
+Environment=LG_WD=/run/smart-door
+Environment=SMART_DOOR_CAMERA=/dev/video0
+Environment=SMART_DOOR_ALSA_DEVICE=default
+EnvironmentFile=-/etc/smart-door/smart-door.env
+LoadCredential=supabase-writer-password:/etc/smart-door/writer-password
+StandardInput=null
+ExecStartPre=/usr/bin/timeout 25s /bin/sh /opt/smart-door/deploy/wait-for-devices.sh ${SMART_DOOR_CAMERA} ${SMART_DOOR_ALSA_DEVICE}
+ExecStart=/opt/smart-door/.venv/bin/python -u /opt/smart-door/src/recognize_face.py --hardware --no-preview --offline-first --state-dir /var/lib/smart-door --camera ${SMART_DOOR_CAMERA} $SMART_DOOR_ARGS
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=35s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

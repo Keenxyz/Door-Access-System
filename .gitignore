@@ -1,0 +1,18 @@
+/.venv/
+/dataset/
+/access_logs.csv
+/door_event_outbox.sqlite3*
+.env
+.env.*
+!.env.example
+**/__pycache__/
+/dashboard.local.json
+/event_photos/
+
+# Copy local model weights to the Pi separately.
+/models/*.onnx
+
+# The existing phone viewer is its own Git checkout.
+/phone/
+# Generated PowerShell cache.
+/Microsoft/Windows/PowerShell/
