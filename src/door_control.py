@@ -58,6 +58,48 @@ class GpioOutputs:
                     output.close()
 
 
+
+class DemoGpioOutputs(GpioOutputs):
+    def __init__(self, **kwargs):
+        self.demo_stop = Event()
+        self.demo_worker = None
+        super().__init__(**kwargs)
+
+    def apply(self, unlock, green, red):
+        self.demo_stop.set()
+        if self.demo_worker is not None:
+            self.demo_worker.join()
+            self.demo_worker = None
+
+        super().apply(False, green, red)
+
+        if unlock and green and self.relay is not None:
+            self.demo_stop.clear()
+            self.demo_worker = Thread(
+                target=self.demo_pulse, daemon=True
+            )
+            self.demo_worker.start()
+
+    def demo_pulse(self):
+        try:
+            if self.demo_stop.wait(0.5):
+                return
+            self.relay.on()
+            if self.demo_stop.wait(0.1):
+                return
+            self.green.off()
+            self.demo_stop.wait(5.9)
+        finally:
+            self.relay.off()
+            self.green.off()
+
+    def close(self):
+        self.demo_stop.set()
+        if self.demo_worker is not None:
+            self.demo_worker.join()
+        super().close()
+
+
 class Speaker:
     MESSAGES = {
         "GRANTED": "Access Granted. Welcome!",

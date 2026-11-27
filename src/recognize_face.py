@@ -50,11 +50,13 @@ def settings(argv=None):
     cloud.add_argument("--supabase", action="store_true", help="Require configured Supabase sync without prompting.")
     cloud.add_argument("--local-only", action="store_true", help="Log without uploading to Supabase.")
     parser.add_argument("--hardware", action="store_true", help="Enable GPIO LEDs and speaker on the Pi.")
+    parser.add_argument("--relay-demo", action="store_true", help="Test face-triggered relay without a connected lock.")
     parser.add_argument("--enable-unlock", action="store_true", help="Enable the installed relay after confirming wiring and liveness.")
     parser.add_argument("--relay-active", choices=("low", "high"), help="The signal level that energizes the relay.")
     parser.add_argument("--lock-type", choices=("power-to-lock", "power-to-unlock"), help="Verified power behavior of the installed lock.")
     parser.add_argument("--pad-model", type=Path, help="Path to the official anti-spoof-mn3 ONNX model.")
     parser.add_argument("--pad-threshold", type=float, default=.90)
+    parser.add_argument("--passive-only", action="store_true", help="Use passive anti-spoofing without head-turn challenges (testing only).")
     parser.add_argument("--liveness-seconds", type=float, default=18)
     parser.add_argument("--threshold", type=float, default=.363, help="SFace cosine similarity threshold.")
     parser.add_argument("--confirm-frames", type=int, default=3)
@@ -90,6 +92,16 @@ def settings(argv=None):
         parser.error("--simulate does not run with --hardware.")
     if args.enable_unlock and args.no_preview and args.no_audio:
         parser.error("Provide a preview or speaker for the liveness prompts.")
+    if args.passive_only and not args.pad_model:
+        parser.error("--passive-only requires --pad-model.")
+    if args.passive_only and args.enable_unlock:
+        parser.error("Passive-only mode is not approved for relay unlocking.")
+    if args.relay_demo and (
+        not args.hardware or not args.relay_active or not args.pad_model
+        or args.enable_unlock or args.simulate or args.relay_bench
+        or args.sync_pending or args.setup_writer
+    ):
+        parser.error("Relay demo requires hardware, relay polarity, PAD and no installed lock.")
     return args
 
 
@@ -160,20 +172,24 @@ def log_access(decision, cloud, *, picture=None, lock_command=None, state_dir=No
 
 
 def controller_for(args, *, simulate=False, bench=False):
-    relay_enabled = simulate or bench or args.enable_unlock
+    relay_enabled = simulate or bench or args.enable_unlock or args.relay_demo
     if simulate or not (args.hardware or bench):
         outputs = SimulatedOutputs(verbose=simulate)
     else:
         model = Path("/proc/device-tree/model")
         if not model.is_file() or "Raspberry Pi" not in model.read_text(errors="ignore"):
             raise RuntimeError("GPIO mode requires a Raspberry Pi. Use --simulate on Windows.")
-        outputs = GpioOutputs(relay_enabled=relay_enabled, active_high=args.relay_active == "high")
+        if args.relay_demo:
+            from door_control import DemoGpioOutputs
+            outputs = DemoGpioOutputs(relay_enabled=True, active_high=args.relay_active == "high")
+        else:
+            outputs = GpioOutputs(relay_enabled=relay_enabled, active_high=args.relay_active == "high")
     speaker = Speaker(enabled=args.hardware and not args.no_audio, simulate=simulate,
                       alsa_device=os.environ.get("SMART_DOOR_ALSA_DEVICE"))
     try:
         if args.enable_unlock and args.no_preview and not speaker.program:
             raise RuntimeError("Install espeak-ng or use a display for the liveness prompts.")
-        return DoorController(outputs, speaker, relay_enabled=relay_enabled, unlock_cooldown=args.unlock_cooldown)
+        return DoorController(outputs, speaker, relay_enabled=relay_enabled, unlock_cooldown=args.unlock_cooldown, pulse_seconds=6.5 if args.relay_demo else PULSE_SECONDS)
     except Exception:
         outputs.close()
         speaker.close()
@@ -263,7 +279,7 @@ def run_camera(args):
     pad = PassiveLiveness(args.pad_model, args.pad_threshold) if args.pad_model else None
     gate = RecognitionGate(frames=args.confirm_frames, leave_seconds=args.leave_seconds,
                            notification_cooldown=args.notification_cooldown,
-                           liveness_seconds=args.liveness_seconds if pad else None,
+                           liveness_seconds=args.liveness_seconds if pad and not args.passive_only else None,
                            unlock_cooldown=max(args.unlock_cooldown, PULSE_SECONDS))
     cloud = camera = None
     controller = controller_for(args)
@@ -338,6 +354,10 @@ def main(argv=None):
             return run_simulation(args)
         if args.relay_bench:
             return run_bench(args)
+        if args.relay_demo:
+            print("Disconnect the solenoid and 12V load.")
+            if input("Type DISCONNECTED: ").strip() != "DISCONNECTED":
+                return 1
         return run_camera(args)
     except KeyboardInterrupt:
         print("\nStopped.")
